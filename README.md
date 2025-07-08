@@ -2,7 +2,7 @@
 
 A demo for testing [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/) servers:
 
-> `https://mcp-client.multidaomensional.workers.dev`
+> https://mcp-client.multidaomensional.workers.dev
 
 Based on this [example](https://github.com/cloudflare/ai/tree/main/demos/mcp-client), which showcases how to:
 
