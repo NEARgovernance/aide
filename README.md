@@ -1,14 +1,14 @@
 # MCP Client
 
-A demo for testing [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/) servers:
+Test [Model Context Protocol](https://spec.modelcontextprotocol.io) servers via the [Bitte MCP proxy](https://docs.bitte.ai/agents/mcp):
 
-> https://mcp-client.multidaomensional.workers.dev
+> https://mcp.bitte.ai
 
-Based on this [example](https://github.com/cloudflare/ai/tree/main/demos/mcp-client), which showcases how to:
+Based on this [example](https://github.com/cloudflare/ai/tree/main/demos/mcp-client), showcasing how to:
 
-- Connect to remote MCP servers via web interface
-- Test tools with auto-generated sample arguments
-- View capabilities (tools, prompts, resources) in real time
+- Access remote MCP servers via web interface
+- View capabilities (tools, prompts, resources)
+- Run tool calls and inspect structured responses
 
 ## Development
 
@@ -18,7 +18,13 @@ Based on this [example](https://github.com/cloudflare/ai/tree/main/demos/mcp-cli
 npm install
 ```
 
-### 2. Run Backend
+### 2. Build
+
+```bash
+npm run build
+```
+
+### 3. Run Backend
 
 _Terminal A_
 
@@ -26,7 +32,7 @@ _Terminal A_
 npx wrangler dev
 ```
 
-### 3. Run Frontend
+### 4. Run Frontend
 
 _Terminal B_
 
@@ -38,9 +44,9 @@ npm start
 
 Open your browser to http://localhost:5173 and start adding MCP servers.
 
-1. **Connect:** Enter name and URL (e.g., `https://disco.multidaomensional.workers.dev/sse`)
-2. **Test Tools:** Click "Test Tool" buttons to try available functionality
-3. **View Schema:** Explore data, tools, prompts, and resources from connected servers
+1. **Connect:** Enter URL (e.g., `https://mcp.bitte.ai/mcp?agentId=hos-agent.vercel.app`)
+2. **Test:** Click "Run Tool" buttons to try the available functionality
+3. **Explore:** View data, tools, prompts, and resources from connected servers
 
 ## Deployment
 
@@ -49,13 +55,3 @@ _using Cloudflare_
 ```bash
 wrangler deploy
 ```
-
-## Stack
-
-- **Frontend:** TypeScript + React + Vite
-- **Backend:** Cloudflare Workers + Durable Objects
-- **Middleware:** Model Context Protocol (MCP)
-
-## License
-
-MIT

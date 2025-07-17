@@ -1,22 +1,33 @@
 import { useAgent } from "agents/react";
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import type { MCPServersState } from "agents";
 import { agentFetch } from "agents/client";
 import { nanoid } from "nanoid";
 
-let sessionId = localStorage.getItem("sessionId");
-if (!sessionId) {
-  sessionId = nanoid(8);
-  localStorage.setItem("sessionId", sessionId);
+const sessionId = nanoid(8);
+
+interface ToolInput {
+  [key: string]: any;
 }
-// TODO: clear sessionId on logout
+
+interface MCPTool {
+  name: string;
+  description?: string;
+  inputSchema?: any;
+  serverId?: string;
+}
+
+interface MCPServerWithError {
+  name: string;
+  state: string;
+  error?: string;
+}
 
 function App() {
   const [isConnected, setIsConnected] = useState(false);
-  const mcpUrlInputRef = useRef<HTMLInputElement>(null);
-  const mcpNameInputRef = useRef<HTMLInputElement>(null);
+  const agentIdInputRef = useRef<HTMLInputElement>(null);
   const [mcpState, setMcpState] = useState<MCPServersState>({
     prompts: [],
     resources: [],
@@ -25,116 +36,234 @@ function App() {
   });
   const [toolResults, setToolResults] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState<Record<string, boolean>>({});
+  const [connectionStatus, setConnectionStatus] = useState<string>("");
+  const [toolInputs, setToolInputs] = useState<Record<string, ToolInput>>({});
+  const [refreshing, setRefreshing] = useState(false);
 
   const agent = useAgent({
     agent: "my-agent",
-    name: sessionId!,
+    name: sessionId,
     host:
       window.location.hostname === "localhost"
         ? "http://localhost:8787"
         : window.location.origin,
-    onClose: () => setIsConnected(false),
-    onMcpUpdate: (mcpServers: MCPServersState) => {
-      setMcpState(mcpServers);
+    onClose: () => {
+      console.warn("🛑 Agent connection closed");
+      setIsConnected(false);
     },
-    onOpen: () => setIsConnected(true),
+    onMcpUpdate: (mcpServers: MCPServersState) => {
+      console.debug(
+        "📡 MCP Update received:",
+        JSON.stringify(mcpServers, null, 2)
+      );
+      setMcpState((prev) => ({ ...prev, ...mcpServers }));
+    },
+    onOpen: () => {
+      console.info("✅ Agent connection opened");
+      setIsConnected(true);
+      refreshMcpState();
+    },
   });
 
-  console.log("Configured host:", agent.host);
-  console.log("Full agent object:", agent);
+  const refreshMcpState = async () => {
+    if (!isConnected) return;
 
-  function openPopup(authUrl: string) {
-    window.open(
-      authUrl,
-      "popupWindow",
-      "width=600,height=800,resizable=yes,scrollbars=yes,toolbar=yes,menubar=no,location=no,directories=no,status=yes"
-    );
-  }
-
-  const handleMcpSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (!mcpUrlInputRef.current || !mcpUrlInputRef.current.value.trim()) return;
-    const serverUrl = mcpUrlInputRef.current.value;
-
-    if (!mcpNameInputRef.current || !mcpNameInputRef.current.value.trim())
-      return;
-    const serverName = mcpNameInputRef.current.value;
-    agentFetch(
-      {
-        agent: "my-agent",
-        host: agent.host,
-        name: sessionId!,
-        path: "add-mcp",
-      },
-      {
-        body: JSON.stringify({ name: serverName, url: serverUrl }),
-        method: "POST",
-      }
-    );
-    setMcpState({
-      ...mcpState,
-      servers: {
-        ...mcpState.servers,
-        placeholder: {
-          auth_url: null,
-          capabilities: null,
-          instructions: null,
-          name: serverName,
-          server_url: serverUrl,
-          state: "connecting",
-        },
-      },
-    });
-
-    // Clear form inputs
-    mcpUrlInputRef.current.value = "";
-    mcpNameInputRef.current.value = "";
-  };
-
-  const removeMcpServer = async (serverId: string) => {
+    setRefreshing(true);
     try {
-      await agentFetch(
+      console.log("🔄 Refreshing MCP state...");
+      const response = await agentFetch(
         {
           agent: "my-agent",
           host: agent.host,
-          name: sessionId!,
-          path: "remove-mcp",
+          name: sessionId,
+          path: "mcp-state",
         },
         {
-          body: JSON.stringify({ serverId }),
-          method: "POST",
+          method: "GET",
         }
       );
-    } catch (err) {
-      console.error("Failed to remove server:", err);
+
+      if (response.ok) {
+        const state = (await response.json()) as MCPServersState;
+        console.log("📊 Received MCP state:", state);
+        setMcpState(state);
+      } else {
+        console.error("Failed to refresh MCP state:", response.status);
+      }
+    } catch (error) {
+      console.error("Error refreshing MCP state:", error);
+    } finally {
+      setRefreshing(false);
     }
   };
 
-  const callTool = async (
-    toolName: string,
-    args: any = {},
-    serverId: string
-  ) => {
-    const toolKey = `${toolName}-${serverId}`;
-    setLoading((prev) => ({ ...prev, [toolKey]: true }));
+  // Auto-refresh MCP state periodically
+  useEffect(() => {
+    if (!isConnected) return;
+
+    const interval = setInterval(() => {
+      refreshMcpState();
+    }, 10000); // Refresh every 10 seconds
+
+    return () => clearInterval(interval);
+  }, [isConnected]);
+
+  const handleAddConnection = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!agentIdInputRef.current || !agentIdInputRef.current.value.trim())
+      return;
+
+    const serverUrl = agentIdInputRef.current.value.trim();
+
+    const urlParams = new URLSearchParams(serverUrl.split("?")[1] || "");
+    const agentId = urlParams.get("agentId") || "Unknown Agent";
+    const serverName = `Bitte Agent: ${agentId}`;
+
+    setConnectionStatus(`Connecting to ${agentId}...`);
 
     try {
       const response = await agentFetch(
         {
           agent: "my-agent",
           host: agent.host,
-          name: sessionId!,
-          path: "call-tool",
+          name: sessionId,
+          path: "add-mcp",
         },
         {
-          body: JSON.stringify({ toolName, args, serverId }),
           method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: serverName, url: serverUrl }),
         }
       );
 
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `Server responded with ${response.status}: ${errorText}`
+        );
+      }
+
+      setConnectionStatus(`✅ Successfully added ${agentId}`);
+      agentIdInputRef.current.value = "";
+
+      setTimeout(() => {
+        refreshMcpState();
+        setConnectionStatus("");
+      }, 2000);
+    } catch (error: any) {
+      setConnectionStatus(`❌ Failed to add MCP server: ${error.message}`);
+      setTimeout(() => setConnectionStatus(""), 5000);
+    }
+  };
+
+  const removeMcpServer = async (serverId: string) => {
+    setConnectionStatus(`Removing server ${serverId}...`);
+    console.log(`[DEBUG] Sending remove-mcp request for: ${serverId}`);
+
+    try {
+      const response = await agentFetch(
+        {
+          agent: "my-agent",
+          host: agent.host,
+          name: sessionId,
+          path: "remove-mcp",
+        },
+        {
+          body: JSON.stringify({ serverId }),
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `Server responded with ${response.status}: ${errorText}`
+        );
+      }
+
+      console.log("[DEBUG] remove-mcp response OK");
+
+      setConnectionStatus(`✅ Removed server ${serverId}`);
+
+      // Refresh state after removing
+      setTimeout(() => {
+        refreshMcpState();
+        setConnectionStatus("");
+      }, 2000);
+    } catch (err: any) {
+      console.error("Failed to remove server:", err);
+      setConnectionStatus(`❌ Failed to remove server: ${err.message}`);
+      setTimeout(() => setConnectionStatus(""), 5000);
+    }
+  };
+
+  const updateToolInput = (toolKey: string, paramName: string, value: any) => {
+    setToolInputs((prev) => ({
+      ...prev,
+      [toolKey]: {
+        ...prev[toolKey],
+        [paramName]: value,
+      },
+    }));
+  };
+
+  const callTool = async (
+    toolName: string,
+    serverId?: string,
+    schema?: any
+  ) => {
+    const toolKey = serverId ? `${toolName}-${serverId}` : toolName;
+    setLoading((prev) => ({ ...prev, [toolKey]: true }));
+
+    try {
+      // Get the input arguments for this tool
+      const toolArgs = toolInputs[toolKey] || {};
+
+      console.log(
+        `[DEBUG] Calling tool "${toolName}" ${
+          serverId ? `on server "${serverId}"` : ""
+        } with:`,
+        toolArgs
+      );
+
+      const requestBody: any = {
+        toolName,
+        args: toolArgs,
+      };
+
+      if (serverId) {
+        requestBody.serverId = serverId;
+      }
+
+      const response = await agentFetch(
+        {
+          agent: "my-agent",
+          host: agent.host,
+          name: sessionId,
+          path: "call-tool",
+        },
+        {
+          body: JSON.stringify(requestBody),
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Tool call failed: ${response.status} ${errorText}`);
+      }
+
       const result = await response.json();
       setToolResults((prev) => ({ ...prev, [toolKey]: result }));
+      console.log("[DEBUG] Tool result:", result);
     } catch (error: any) {
+      console.error("Tool call error:", error);
       setToolResults((prev) => ({
         ...prev,
         [toolKey]: { error: error.message },
@@ -144,290 +273,318 @@ function App() {
     }
   };
 
-  const getDefaultArgs = (tool: any) => {
+  const renderToolInputs = (tool: MCPTool) => {
+    const toolKey = tool.serverId
+      ? `${String(tool.name)}-${String(tool.serverId)}`
+      : String(tool.name);
     const schema = tool.inputSchema;
-    const args: any = {};
 
-    if (schema?.properties) {
-      Object.entries(schema.properties).forEach(
-        ([key, prop]: [string, any]) => {
-          if (prop.default !== undefined) {
-            args[key] = prop.default;
-          } else if (schema.required?.includes(key)) {
-            // Provide sample values for required fields
-            if (key === "query") args[key] = "governance";
-            if (key === "id") args[key] = "1";
-          }
-        }
+    if (!schema?.properties) return null;
+
+    return (
+      <div className="tool-inputs">
+        <h4>Parameters:</h4>
+        {Object.entries(schema.properties).map(
+          ([paramName, paramDef]: [string, any]) => (
+            <div
+              key={paramName}
+              className="input-group"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "4px",
+                marginBottom: "16px",
+              }}
+            >
+              <label style={{ fontWeight: "500" }}>
+                {paramName}
+                {schema.required?.includes(paramName) && (
+                  <span className="required" style={{ color: "red" }}>
+                    *
+                  </span>
+                )}
+              </label>
+              {paramDef.type === "boolean" ? (
+                <select
+                  value={toolInputs[toolKey]?.[paramName] || ""}
+                  onChange={(e) =>
+                    updateToolInput(
+                      toolKey,
+                      paramName,
+                      e.target.value === "true"
+                    )
+                  }
+                  style={{ padding: "8px", fontSize: "1rem" }}
+                >
+                  <option value="">Select...</option>
+                  <option value="true">True</option>
+                  <option value="false">False</option>
+                </select>
+              ) : (
+                <input
+                  type={paramDef.type === "number" ? "number" : "text"}
+                  placeholder={paramDef.description || `Enter ${paramName}`}
+                  value={toolInputs[toolKey]?.[paramName] || ""}
+                  onChange={(e) =>
+                    updateToolInput(
+                      toolKey,
+                      paramName,
+                      paramDef.type === "number"
+                        ? Number(e.target.value)
+                        : e.target.value
+                    )
+                  }
+                  style={{
+                    padding: "8px",
+                    fontSize: "1rem",
+                    borderRadius: "6px",
+                    border: "1px solid #ccc",
+                  }}
+                />
+              )}
+            </div>
+          )
+        )}
+      </div>
+    );
+  };
+
+  const renderToolResult = (result: any) => {
+    if (!result) return null;
+
+    if (result.error) {
+      return (
+        <div className="result error">
+          <strong>Error:</strong>
+          <pre>{result.error}</pre>
+        </div>
       );
     }
 
-    return args;
+    // Handle MCP tool results that have content array
+    if (result.content && Array.isArray(result.content)) {
+      return (
+        <div className="result success">
+          <strong>Result:</strong>
+          {result.content.map((item: any, index: number) => (
+            <div key={index} className="result-item">
+              {item.type === "text" ? (
+                <pre>{item.text}</pre>
+              ) : (
+                <pre>{JSON.stringify(item, null, 2)}</pre>
+              )}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // Fallback to JSON display
+    return (
+      <div className="result success">
+        <strong>Result:</strong>
+        <pre>{JSON.stringify(result, null, 2)}</pre>
+      </div>
+    );
   };
 
   return (
     <div className="container">
-      <div className="status-indicator">
-        <div className={`status-dot ${isConnected ? "connected" : ""}`} />
-        {isConnected ? "Connected to server" : "Disconnected"}
-      </div>
-
-      <div className="mcp-servers">
-        <form className="mcp-form" onSubmit={handleMcpSubmit}>
-          <input
-            type="text"
-            ref={mcpNameInputRef}
-            className="mcp-input name"
-            placeholder="MCP Server Name"
-          />
-          <input
-            type="text"
-            ref={mcpUrlInputRef}
-            className="mcp-input url"
-            placeholder="MCP Server URL"
-          />
-          <button type="submit">Add MCP Server</button>
-        </form>
-      </div>
-
-      <div className="mcp-section">
-        <h2>MCP Servers</h2>
-        {Object.entries(mcpState.servers).map(([id, server]) => (
-          <div key={id} className={"mcp-server"}>
-            <div>
-              <b>{String(server.name)}</b>{" "}
-              <span>({String(server.server_url)})</span>
-              <div className="status-indicator">
-                <div
-                  className={`status-dot ${
-                    String(server.state) === "ready" ? "connected" : ""
-                  }`}
-                />
-                {String(server.state)} (id: {String(id)})
-              </div>
-            </div>
-            <div
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+        }}
+      >
+        <h1>Bitte MCP Client</h1>
+        <div
+          className="status"
+          style={{ display: "flex", alignItems: "center" }}
+        >
+          <span className={`dot ${isConnected ? "connected" : ""}`}></span>
+          <span style={{ marginLeft: "6px" }}>
+            {isConnected ? "Connected" : "Disconnected"}
+          </span>
+          {isConnected && (
+            <button
+              onClick={refreshMcpState}
+              disabled={refreshing}
+              className="refresh-btn"
               style={{
-                display: "flex",
-                gap: "10px",
-                alignItems: "center",
-                marginTop: "10px",
+                marginLeft: "10px",
+                fontSize: "12px",
+                padding: "2px 6px",
               }}
             >
-              {String(server.state) === "authenticating" && server.auth_url && (
+              {refreshing ? "🔄" : "↻"} Refresh
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="section">
+        <h2>Connect</h2>
+        {connectionStatus && (
+          <div
+            className={`connection-status ${
+              connectionStatus.includes("❌")
+                ? "error"
+                : connectionStatus.includes("✅")
+                ? "success"
+                : "info"
+            }`}
+          >
+            {connectionStatus}
+          </div>
+        )}
+        <p className="help-text">Bitte MCP Link:</p>
+        <form onSubmit={handleAddConnection}>
+          <input
+            ref={agentIdInputRef}
+            type="text"
+            placeholder="https://mcp.bitte.ai/mcp?agentId={YOUR_AGENT_ID}"
+            required
+            disabled={!isConnected}
+          />
+          <button type="submit" disabled={!isConnected}>
+            Add
+          </button>
+        </form>
+        <div>
+          <p>
+            <b>Example:</b>
+            <br />
+            <code>https://mcp.bitte.ai/mcp?agentId=hos-agent.vercel.app</code>
+          </p>
+          <p>
+            To learn more, refer to the{" "}
+            <a href="https://docs.bitte.ai/agents/mcp">documentation</a>.
+          </p>
+        </div>
+      </div>
+
+      <div className="section">
+        <h2>Agents ({Object.keys(mcpState.servers).length})</h2>
+        {Object.keys(mcpState.servers).length === 0 ? (
+          <p className="empty-state">No agents connected yet. Add one above!</p>
+        ) : (
+          Object.entries(mcpState.servers).map(([id, server]) => {
+            const serverWithError = server as MCPServerWithError;
+            return (
+              <div key={id} className="server">
+                <div className="server-info">
+                  <strong>{String(serverWithError.name)}</strong>
+                  <div className="server-details">
+                    <div className="server-status">
+                      <span
+                        className={`dot ${
+                          String(serverWithError.state) === "ready"
+                            ? "connected"
+                            : String(serverWithError.state) === "error"
+                            ? "error"
+                            : ""
+                        }`}
+                      ></span>
+                      {String(serverWithError.state)}
+                    </div>
+                    {serverWithError.error && (
+                      <div className="server-error">
+                        Error: {String(serverWithError.error)}
+                      </div>
+                    )}
+                  </div>
+                </div>
                 <button
-                  type="button"
-                  onClick={() => openPopup(String(server.auth_url))}
-                >
-                  Authorize
-                </button>
-              )}
-              {String(server.state) === "ready" && (
-                <button
-                  type="button"
                   onClick={() => removeMcpServer(String(id))}
-                  style={{
-                    padding: "6px 12px",
-                    background: "#d63031",
-                    color: "white",
-                    border: "none",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                  }}
+                  className="remove-btn"
+                  disabled={!isConnected}
                 >
                   Remove
                 </button>
-              )}
-            </div>
-          </div>
-        ))}
+              </div>
+            );
+          })
+        )}
       </div>
 
-      <div className="messages-section">
-        <h2>Server Data</h2>
-        <h3>Tools</h3>
-        {mcpState.tools.map((tool) => {
-          const toolKey = `${String(tool.name)}-${String(tool.serverId)}`;
-          const result = toolResults[toolKey];
-          const isLoading = loading[toolKey];
-
-          return (
-            <div
-              key={toolKey}
-              style={{
-                marginBottom: "20px",
-                border: "1px solid #ddd",
-                padding: "15px",
-                borderRadius: "8px",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "flex-start",
-                  marginBottom: "10px",
-                }}
-              >
-                <div style={{ flex: 1 }}>
-                  <b>{String(tool.name)}</b>
-                  {tool.description && (
-                    <p
-                      style={{
-                        margin: "5px 0",
-                        color: "#666",
-                        fontSize: "14px",
-                      }}
-                    >
-                      {String(tool.description)}
-                    </p>
-                  )}
-                  <span
-                    style={{
-                      fontSize: "12px",
-                      background: "#e74c3c",
-                      color: "white",
-                      padding: "2px 6px",
-                      borderRadius: "3px",
-                    }}
-                  >
-                    Server: {String(tool.serverId)}
-                  </span>
-                </div>
-                <button
-                  onClick={() =>
-                    callTool(
-                      String(tool.name),
-                      getDefaultArgs(tool),
-                      String(tool.serverId)
-                    )
-                  }
-                  disabled={isLoading}
-                  style={{
-                    padding: "8px 16px",
-                    background: isLoading ? "#bdc3c7" : "#00b894",
-                    color: "white",
-                    border: "none",
-                    borderRadius: "4px",
-                    cursor: isLoading ? "not-allowed" : "pointer",
-                    marginLeft: "15px",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {isLoading ? "Testing..." : "Test Tool"}
-                </button>
-              </div>
-
-              {/* Tool Result */}
-              {result && (
-                <div
-                  style={{
-                    marginBottom: "10px",
-                    padding: "10px",
-                    background: result.error ? "#ffe6e6" : "#e8f5e8",
-                    borderRadius: "4px",
-                    border: result.error
-                      ? "1px solid #ff7675"
-                      : "1px solid #00b894",
-                  }}
-                >
-                  <strong>{result.error ? "Error:" : "Result:"}</strong>
-                  <pre
-                    style={{
-                      margin: "5px 0 0 0",
-                      fontSize: "12px",
-                      whiteSpace: "pre-wrap",
-                      maxHeight: "300px",
-                      overflow: "auto",
-                    }}
-                  >
-                    {JSON.stringify(result, null, 2)}
-                  </pre>
-                </div>
-              )}
-
-              <details>
-                <summary style={{ cursor: "pointer", fontWeight: "bold" }}>
-                  Tool Schema
-                </summary>
-                <pre className="code" style={{ marginTop: "10px" }}>
-                  {JSON.stringify(tool, null, 2)}
-                </pre>
-              </details>
-            </div>
-          );
-        })}
-
-        <h3>Prompts</h3>
-        {mcpState.prompts.length === 0 ? (
-          <p style={{ color: "#666", fontStyle: "italic" }}>
-            No prompts available
+      <div className="section">
+        <h2>Tools ({mcpState.tools.length})</h2>
+        {mcpState.tools.length === 0 ? (
+          <p className="empty-state">
+            {Object.keys(mcpState.servers).length === 0
+              ? "Connect an agent to see available tools"
+              : "No tools available from connected agents"}
           </p>
         ) : (
-          mcpState.prompts.map((prompt) => (
-            <div
-              key={`${prompt.name}-${String(prompt.serverId)}`}
-              style={{
-                marginBottom: "15px",
-                border: "1px solid #ddd",
-                padding: "10px",
-                borderRadius: "6px",
-              }}
-            >
-              <b>{String(prompt.name)}</b>
-              <span
-                style={{
-                  fontSize: "12px",
-                  background: "#6c5ce7",
-                  color: "white",
-                  padding: "2px 6px",
-                  borderRadius: "3px",
-                  marginLeft: "10px",
-                }}
-              >
-                Server: {String(prompt.serverId)}
-              </span>
-              <pre className="code">{JSON.stringify(prompt, null, 2)}</pre>
-            </div>
-          ))
-        )}
+          mcpState.tools.map((tool) => {
+            const mcpTool = tool as MCPTool;
+            const toolKey = mcpTool.serverId
+              ? `${String(mcpTool.name)}-${String(mcpTool.serverId)}`
+              : String(mcpTool.name);
+            const result = toolResults[toolKey];
+            const isLoading = loading[toolKey];
 
-        <h3>Resources</h3>
-        {mcpState.resources.length === 0 ? (
-          <p style={{ color: "#666", fontStyle: "italic" }}>
-            No resources available
-          </p>
-        ) : (
-          mcpState.resources.map((resource) => (
-            <div
-              key={`${resource.name}-${String(resource.serverId)}`}
-              style={{
-                marginBottom: "15px",
-                border: "1px solid #ddd",
-                padding: "10px",
-                borderRadius: "6px",
-              }}
-            >
-              <b>{String(resource.name)}</b>
-              <span
-                style={{
-                  fontSize: "12px",
-                  background: "#a29bfe",
-                  color: "white",
-                  padding: "2px 6px",
-                  borderRadius: "3px",
-                  marginLeft: "10px",
-                }}
-              >
-                Server: {String(resource.serverId)}
-              </span>
-              <div style={{ fontSize: "14px", color: "#666", margin: "5px 0" }}>
-                URI: {String(resource.uri)}
+            return (
+              <div key={toolKey} className="tool">
+                <div className="tool-header">
+                  <div className="tool-info">
+                    <strong>{String(mcpTool.name)}</strong>
+                    {mcpTool.description && (
+                      <p className="tool-description">
+                        {String(mcpTool.description)}
+                      </p>
+                    )}
+                    {mcpTool.serverId && (
+                      <small className="tool-server">
+                        Server: {String(mcpTool.serverId)}
+                      </small>
+                    )}
+                  </div>
+                  <button
+                    onClick={() =>
+                      callTool(
+                        String(mcpTool.name),
+                        mcpTool.serverId ? String(mcpTool.serverId) : undefined,
+                        mcpTool.inputSchema
+                      )
+                    }
+                    disabled={isLoading || !isConnected}
+                    className="test-btn"
+                  >
+                    {isLoading ? "Running..." : "Run Tool"}
+                  </button>
+                </div>
+
+                {renderToolInputs(mcpTool)}
+                {renderToolResult(result)}
               </div>
-              <pre className="code">{JSON.stringify(resource, null, 2)}</pre>
-            </div>
-          ))
+            );
+          })
         )}
+      </div>
+
+      <div className="section">
+        <h2>Debug</h2>
+        <details>
+          <summary>View MCP State</summary>
+          <pre className="debug-info">{JSON.stringify(mcpState, null, 2)}</pre>
+        </details>
+        <details>
+          <summary>Session Info</summary>
+          <pre className="debug-info">
+            {JSON.stringify(
+              {
+                sessionId,
+                isConnected,
+                agentHost: agent.host,
+                timestamp: new Date().toISOString(),
+              },
+              null,
+              2
+            )}
+          </pre>
+        </details>
       </div>
     </div>
   );

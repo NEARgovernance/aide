@@ -1,12 +1,13 @@
 {
-  "name": "mcp-client",
+  "name": "bitte-mcp-client",
+  "version": "0.0.1",
+  "description": "open agency",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "vite dev",
-    "build": "npm run build:server && npm run build:client",
-    "build:server": "vite build --mode server",
-    "build:client": "vite build --mode client",
+    "build": "vite build",
     "deploy": "npx wrangler deploy --var HOST:$(./get-subdomain.sh)",
     "type-check": "tsc --noEmit"
   },
@@ -20,7 +21,7 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.8.0",
+    "@cloudflare/vite-plugin": "^1.9.4",
     "@cloudflare/workers-types": "^4.20250701.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
