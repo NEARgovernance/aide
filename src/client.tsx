@@ -17,17 +17,21 @@ interface MCPTool {
   description?: string;
   inputSchema?: any;
   serverId?: string;
+  serverType?: "bitte" | "direct" | "unknown";
 }
 
 interface MCPServerWithError {
   name: string;
   state: string;
   error?: string;
+  type?: string;
 }
 
 function App() {
   const [isConnected, setIsConnected] = useState(false);
   const agentIdInputRef = useRef<HTMLInputElement>(null);
+  const discourseUrlRef = useRef<HTMLInputElement>(null);
+  const discourseApiKeyRef = useRef<HTMLInputElement>(null);
   const [mcpState, setMcpState] = useState<MCPServersState>({
     prompts: [],
     resources: [],
@@ -39,6 +43,7 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<string>("");
   const [toolInputs, setToolInputs] = useState<Record<string, ToolInput>>({});
   const [refreshing, setRefreshing] = useState(false);
+  const [activeTab, setActiveTab] = useState<"bitte" | "discourse">("bitte");
 
   const agent = useAgent({
     agent: "my-agent",
@@ -97,29 +102,92 @@ function App() {
     }
   };
 
-  // Auto-refresh MCP state periodically
   useEffect(() => {
     if (!isConnected) return;
 
     const interval = setInterval(() => {
       refreshMcpState();
-    }, 10000); // Refresh every 10 seconds
+    }, 10000);
 
     return () => clearInterval(interval);
   }, [isConnected]);
 
-  const handleAddConnection = async (e: React.FormEvent<HTMLFormElement>) => {
+  const handleAddBitteConnection = async (
+    e: React.FormEvent<HTMLFormElement>
+  ) => {
     e.preventDefault();
     if (!agentIdInputRef.current || !agentIdInputRef.current.value.trim())
       return;
 
     const serverUrl = agentIdInputRef.current.value.trim();
-
     const urlParams = new URLSearchParams(serverUrl.split("?")[1] || "");
     const agentId = urlParams.get("agentId") || "Unknown Agent";
     const serverName = `Bitte Agent: ${agentId}`;
 
-    setConnectionStatus(`Connecting to ${agentId}...`);
+    await addMCPServer(serverName, serverUrl, "bitte");
+    if (agentIdInputRef.current) {
+      agentIdInputRef.current.value = "";
+    }
+  };
+
+  const handleAddDiscourseConnection = async (
+    e: React.FormEvent<HTMLFormElement>
+  ) => {
+    e.preventDefault();
+    if (!discourseUrlRef.current || !discourseUrlRef.current.value.trim())
+      return;
+
+    const serverUrl = discourseUrlRef.current.value.trim();
+    const apiKey = discourseApiKeyRef.current?.value.trim() || "";
+
+    setConnectionStatus("Connecting to NEAR Discourse...");
+
+    try {
+      const response = await agentFetch(
+        {
+          agent: "my-agent",
+          host: agent.host,
+          name: sessionId,
+          path: "add-discourse",
+        },
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: serverUrl,
+            apiKey: apiKey || undefined,
+            name: "NEAR Discourse",
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `Server responded with ${response.status}: ${errorText}`
+        );
+      }
+
+      setConnectionStatus("✅ Successfully added NEAR Discourse");
+      if (discourseUrlRef.current) discourseUrlRef.current.value = "";
+      if (discourseApiKeyRef.current) discourseApiKeyRef.current.value = "";
+
+      setTimeout(() => {
+        refreshMcpState();
+        setConnectionStatus("");
+      }, 2000);
+    } catch (error: any) {
+      setConnectionStatus(`❌ Failed to add Discourse: ${error.message}`);
+      setTimeout(() => setConnectionStatus(""), 5000);
+    }
+  };
+
+  const addMCPServer = async (
+    name: string,
+    url: string,
+    type: "bitte" | "direct"
+  ) => {
+    setConnectionStatus(`Connecting to ${name}...`);
 
     try {
       const response = await agentFetch(
@@ -132,7 +200,7 @@ function App() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: serverName, url: serverUrl }),
+          body: JSON.stringify({ name, url, type }),
         }
       );
 
@@ -143,8 +211,7 @@ function App() {
         );
       }
 
-      setConnectionStatus(`✅ Successfully added ${agentId}`);
-      agentIdInputRef.current.value = "";
+      setConnectionStatus(`✅ Successfully added ${name}`);
 
       setTimeout(() => {
         refreshMcpState();
@@ -185,10 +252,8 @@ function App() {
       }
 
       console.log("[DEBUG] remove-mcp response OK");
-
       setConnectionStatus(`✅ Removed server ${serverId}`);
 
-      // Refresh state after removing
       setTimeout(() => {
         refreshMcpState();
         setConnectionStatus("");
@@ -219,7 +284,6 @@ function App() {
     setLoading((prev) => ({ ...prev, [toolKey]: true }));
 
     try {
-      // Get the input arguments for this tool
       const toolArgs = toolInputs[toolKey] || {};
 
       console.log(
@@ -361,7 +425,6 @@ function App() {
       );
     }
 
-    // Handle MCP tool results that have content array
     if (result.content && Array.isArray(result.content)) {
       return (
         <div className="result success">
@@ -379,12 +442,69 @@ function App() {
       );
     }
 
-    // Fallback to JSON display
     return (
       <div className="result success">
         <strong>Result:</strong>
         <pre>{JSON.stringify(result, null, 2)}</pre>
       </div>
+    );
+  };
+
+  const getServerTypeIcon = (type?: string) => {
+    switch (type) {
+      case "bitte":
+        return "🤖";
+      case "direct":
+        return "🔗";
+      default:
+        return "❓";
+    }
+  };
+
+  const getGovernanceTools = () => {
+    return mcpState.tools.filter((tool: MCPTool) => {
+      const toolName = String(tool.name).toLowerCase();
+      const toolDesc = String(tool.description || "").toLowerCase();
+      const serverId = String(tool.serverId || "").toLowerCase();
+
+      // Specific tool names from your Discourse server
+      const discourseTools = [
+        "get_latest_topics",
+        "search_posts",
+        "get_topic",
+        "get_recent_posts",
+      ];
+
+      // General governance patterns
+      const governancePatterns = [
+        "proposal",
+        "vote",
+        "governance",
+        "discourse",
+        "forum",
+        "stake",
+        "hos",
+      ];
+
+      return (
+        discourseTools.includes(toolName) ||
+        governancePatterns.some(
+          (pattern) =>
+            toolName.includes(pattern) ||
+            toolDesc.includes(pattern) ||
+            serverId.includes(pattern)
+        )
+      );
+    });
+  };
+
+  const getNonGovernanceTools = () => {
+    const govTools = getGovernanceTools();
+    return mcpState.tools.filter(
+      (tool: MCPTool) =>
+        !govTools.find(
+          (gt) => gt.name === tool.name && gt.serverId === tool.serverId
+        )
     );
   };
 
@@ -397,7 +517,7 @@ function App() {
           alignItems: "center",
         }}
       >
-        <h1>Bitte MCP Client</h1>
+        <h1>🏛️ NEAR Governance MCP Client</h1>
         <div
           className="status"
           style={{ display: "flex", alignItems: "center" }}
@@ -424,7 +544,7 @@ function App() {
       </div>
 
       <div className="section">
-        <h2>Connect</h2>
+        <h2>Connect Servers</h2>
         {connectionStatus && (
           <div
             className={`connection-status ${
@@ -438,43 +558,102 @@ function App() {
             {connectionStatus}
           </div>
         )}
-        <p className="help-text">Bitte MCP Link:</p>
-        <form onSubmit={handleAddConnection}>
-          <input
-            ref={agentIdInputRef}
-            type="text"
-            placeholder="https://mcp.bitte.ai/mcp?agentId={YOUR_AGENT_ID}"
-            required
-            disabled={!isConnected}
-          />
-          <button type="submit" disabled={!isConnected}>
-            Add
+
+        <div className="tabs" style={{ marginBottom: "20px" }}>
+          <button
+            className={activeTab === "bitte" ? "tab active" : "tab"}
+            onClick={() => setActiveTab("bitte")}
+          >
+            🤖 Bitte AI Agents
           </button>
-        </form>
-        <div>
-          <p>
-            <b>Example:</b>
-            <br />
-            <code>https://mcp.bitte.ai/mcp?agentId=hos-agent.vercel.app</code>
-          </p>
-          <p>
-            To learn more, refer to the{" "}
-            <a href="https://docs.bitte.ai/agents/mcp">documentation</a>.
-          </p>
+          <button
+            className={activeTab === "discourse" ? "tab active" : "tab"}
+            onClick={() => setActiveTab("discourse")}
+          >
+            💬 NEAR Discourse
+          </button>
         </div>
+
+        {activeTab === "bitte" && (
+          <div>
+            <p className="help-text">Bitte MCP Link:</p>
+            <form onSubmit={handleAddBitteConnection}>
+              <input
+                ref={agentIdInputRef}
+                type="text"
+                placeholder="https://mcp.bitte.ai/mcp?agentId={YOUR_AGENT_ID}"
+                required
+                disabled={!isConnected}
+              />
+              <button type="submit" disabled={!isConnected}>
+                Add Bitte Agent
+              </button>
+            </form>
+            <div>
+              <p>
+                <b>Example:</b>
+                <br />
+                <code>
+                  https://mcp.bitte.ai/mcp?agentId=hos-agent.vercel.app
+                </code>
+              </p>
+            </div>
+          </div>
+        )}
+
+        {activeTab === "discourse" && (
+          <div>
+            <p className="help-text">NEAR Discourse MCP Server:</p>
+            <form onSubmit={handleAddDiscourseConnection}>
+              <input
+                ref={discourseUrlRef}
+                type="text"
+                placeholder="https://disco.multidaomensional.workers.dev/sse"
+                defaultValue="https://disco.multidaomensional.workers.dev/sse"
+                required
+                disabled={!isConnected}
+                style={{ marginBottom: "10px" }}
+              />
+              <input
+                ref={discourseApiKeyRef}
+                type="text"
+                placeholder="API Key (optional - leave empty for public access)"
+                disabled={!isConnected}
+              />
+              <button type="submit" disabled={!isConnected}>
+                Add Discourse Server
+              </button>
+            </form>
+            <div>
+              <p>
+                <b>✅ Status:</b> SSE transport working perfectly with /sse
+                endpoint
+              </p>
+              <p>
+                <b>Available Tools:</b> get_latest_topics, search_posts,
+                get_topic, get_recent_posts
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="section">
-        <h2>Agents ({Object.keys(mcpState.servers).length})</h2>
+        <h2>Connected Servers ({Object.keys(mcpState.servers).length})</h2>
         {Object.keys(mcpState.servers).length === 0 ? (
-          <p className="empty-state">No agents connected yet. Add one above!</p>
+          <p className="empty-state">
+            No servers connected yet. Add one above!
+          </p>
         ) : (
           Object.entries(mcpState.servers).map(([id, server]) => {
             const serverWithError = server as MCPServerWithError;
             return (
               <div key={id} className="server">
                 <div className="server-info">
-                  <strong>{String(serverWithError.name)}</strong>
+                  <strong>
+                    {getServerTypeIcon(serverWithError.type)}{" "}
+                    {String(serverWithError.name)}
+                  </strong>
                   <div className="server-details">
                     <div className="server-status">
                       <span
@@ -487,6 +666,17 @@ function App() {
                         }`}
                       ></span>
                       {String(serverWithError.state)}
+                      {serverWithError.type && (
+                        <span
+                          style={{
+                            marginLeft: "8px",
+                            fontSize: "0.9em",
+                            opacity: "0.7",
+                          }}
+                        >
+                          ({serverWithError.type})
+                        </span>
+                      )}
                     </div>
                     {serverWithError.error && (
                       <div className="server-error">
@@ -509,15 +699,67 @@ function App() {
       </div>
 
       <div className="section">
-        <h2>Tools ({mcpState.tools.length})</h2>
-        {mcpState.tools.length === 0 ? (
+        <h2>🏛️ Governance Tools ({getGovernanceTools().length})</h2>
+        {getGovernanceTools().length === 0 ? (
           <p className="empty-state">
-            {Object.keys(mcpState.servers).length === 0
-              ? "Connect an agent to see available tools"
-              : "No tools available from connected agents"}
+            No governance tools available. Connect House of Stake or Discourse
+            servers above.
           </p>
         ) : (
-          mcpState.tools.map((tool) => {
+          getGovernanceTools().map((tool) => {
+            const mcpTool = tool as MCPTool;
+            const toolKey = mcpTool.serverId
+              ? `${String(mcpTool.name)}-${String(mcpTool.serverId)}`
+              : String(mcpTool.name);
+            const result = toolResults[toolKey];
+            const isLoading = loading[toolKey];
+
+            return (
+              <div key={toolKey} className="tool governance-tool">
+                <div className="tool-header">
+                  <div className="tool-info">
+                    <strong>🏛️ {String(mcpTool.name)}</strong>
+                    {mcpTool.description && (
+                      <p className="tool-description">
+                        {String(mcpTool.description)}
+                      </p>
+                    )}
+                    {mcpTool.serverId && (
+                      <small className="tool-server">
+                        Server: {getServerTypeIcon(mcpTool.serverType)}{" "}
+                        {String(mcpTool.serverId)}
+                      </small>
+                    )}
+                  </div>
+                  <button
+                    onClick={() =>
+                      callTool(
+                        String(mcpTool.name),
+                        mcpTool.serverId ? String(mcpTool.serverId) : undefined,
+                        mcpTool.inputSchema
+                      )
+                    }
+                    disabled={isLoading || !isConnected}
+                    className="test-btn governance-btn"
+                  >
+                    {isLoading ? "Running..." : "Run Tool"}
+                  </button>
+                </div>
+
+                {renderToolInputs(mcpTool)}
+                {renderToolResult(result)}
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div className="section">
+        <h2>Other Tools ({getNonGovernanceTools().length})</h2>
+        {getNonGovernanceTools().length === 0 ? (
+          <p className="empty-state">No additional tools available.</p>
+        ) : (
+          getNonGovernanceTools().map((tool) => {
             const mcpTool = tool as MCPTool;
             const toolKey = mcpTool.serverId
               ? `${String(mcpTool.name)}-${String(mcpTool.serverId)}`
@@ -537,7 +779,8 @@ function App() {
                     )}
                     {mcpTool.serverId && (
                       <small className="tool-server">
-                        Server: {String(mcpTool.serverId)}
+                        Server: {getServerTypeIcon(mcpTool.serverType)}{" "}
+                        {String(mcpTool.serverId)}
                       </small>
                     )}
                   </div>
