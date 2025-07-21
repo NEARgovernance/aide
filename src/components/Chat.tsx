@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import type { MCPConnection } from "../mcp";
 import { nanoid } from "nanoid";
+import ProposalCard from "./ProposalCard"; // Import your ProposalCard component
 
 const getBaseUrl = () =>
   window.location.hostname === "localhost"
@@ -20,7 +21,7 @@ const getApiKey = () => localStorage.getItem("anthropic_key");
 const setApiKey = (key: string) => localStorage.setItem("anthropic_key", key);
 const clearApiKey = () => localStorage.removeItem("anthropic_key");
 
-// Types (same as before)
+// Types
 interface ChatProps {
   mcpConnection: MCPConnection;
 }
@@ -32,6 +33,7 @@ interface Proposal {
   status: string;
   proposer_id: string;
   voting_options?: string[];
+  voting_ends?: string;
 }
 
 interface Discussion {
@@ -95,6 +97,23 @@ export default function Chat({ mcpConnection }: ChatProps) {
   }, []);
 
   useEffect(() => {
+    const savedKey = localStorage.getItem("anthropic_key");
+    if (savedKey) setApiKey(savedKey);
+  }, []);
+
+  useEffect(() => {
+    console.log("🔍 Current messages count:", messages.length);
+    messages.forEach((msg, i) => {
+      if (msg.content.includes("Governance Ecosystem Analysis")) {
+        console.log(
+          `🎯 Found sentiment message at index ${i}:`,
+          msg.content.substring(0, 100)
+        );
+      }
+    });
+  }, [messages]);
+
+  useEffect(() => {
     return () => {
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
@@ -102,43 +121,61 @@ export default function Chat({ mcpConnection }: ChatProps) {
     };
   }, []);
 
-  // Simple API key save
+  // Save API key
   const handleSaveApiKey = () => {
     if (apiKey.startsWith("sk-ant-")) {
-      setApiKey(apiKey);
+      localStorage.setItem("anthropic_key", apiKey);
+      setApiKeyState(apiKey);
       setShowApiKeyInput(false);
     } else {
       alert('API key should start with "sk-ant-"');
     }
   };
 
-  const startEventStream = (querySessionId: string) => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
+  async function startEventStream(sessionId: string) {
+    const response = await fetch(
+      `${getBaseUrl()}/agents/my-agent/${sessionId}/events`,
+      {
+        headers: {
+          Accept: "text/event-stream",
+          "x-api-key": getApiKey()!,
+        },
+      }
+    );
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      let lines = buffer.split("\n");
+
+      // Keep last incomplete line in buffer
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const jsonPart = line.slice(6);
+          try {
+            const event = JSON.parse(jsonPart);
+            handleAGUIEvent(event);
+          } catch (err) {
+            console.warn("Failed to parse SSE line:", jsonPart);
+          }
+        }
+      }
     }
 
-    const eventSource = new EventSource(
-      `${getBaseUrl()}/agents/my-agent/${
-        mcpConnection.sessionId
-      }/events?session=${querySessionId}`
-    );
-    eventSourceRef.current = eventSource;
+    setIsStreaming(false);
+    setIsLoading(false);
+  }
 
-    eventSource.onmessage = (event) => {
-      try {
-        const agentEvent = JSON.parse(event.data) as AGUIEvent;
-        handleAGUIEvent(agentEvent);
-      } catch (err) {
-        console.error("Failed to parse event:", err);
-      }
-    };
-
-    eventSource.onerror = (e) => {
-      console.error("EventSource error:", e);
-      setIsStreaming(false);
-    };
-  };
-
+  // AG-UI event handler
   const handleAGUIEvent = (agentEvent: AGUIEvent) => {
     setEventStream((prev) => [...prev, agentEvent]);
 
@@ -151,12 +188,12 @@ export default function Chat({ mcpConnection }: ChatProps) {
         break;
 
       case "RUN_STARTED":
-        console.log("🏁 Governance analysis started");
+        console.log("🏁 Run started");
         setIsStreaming(true);
         break;
 
       case "TEXT_MESSAGE_START":
-        const newMessageId = nanoid();
+        const newMessageId = agentEvent.messageId || nanoid();
         streamMessageIdRef.current = newMessageId;
         setMessages((prev) => [
           ...prev,
@@ -170,47 +207,102 @@ export default function Chat({ mcpConnection }: ChatProps) {
         break;
 
       case "TEXT_MESSAGE_CONTENT":
-        if (streamMessageIdRef.current) {
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === streamMessageIdRef.current
-                ? { ...msg, content: msg.content + agentEvent.delta }
-                : msg
-            )
+        setMessages((prev) => {
+          const targetMessageId =
+            streamMessageIdRef.current || agentEvent.messageId;
+
+          if (!targetMessageId) {
+            console.warn(
+              "⚠️ TEXT_MESSAGE_CONTENT but no message ID available:",
+              agentEvent
+            );
+            return prev;
+          }
+
+          const updated = prev.map((msg) =>
+            msg.id === targetMessageId
+              ? { ...msg, content: msg.content + agentEvent.delta }
+              : msg
           );
-        }
+
+          const currentMessage = updated.find(
+            (msg) => msg.id === targetMessageId
+          );
+          console.log("🔍 Message update:", {
+            messageId: targetMessageId,
+            deltaLength: agentEvent.delta?.length,
+            totalLength: currentMessage?.content?.length,
+            lastChars: currentMessage?.content?.slice(-50),
+          });
+
+          return updated;
+        });
+        break;
+
+      case "TEXT_MESSAGE_END":
+        console.log("📝 Message completed for:", streamMessageIdRef.current);
+        const completedMessageId = streamMessageIdRef.current;
+        setTimeout(() => {
+          if (streamMessageIdRef.current === completedMessageId) {
+            streamMessageIdRef.current = null;
+          }
+        }, 100);
+        break;
+
+      case "TOOL_CALL_START":
+        console.log("🔧 Tool call started:", agentEvent.toolName);
+        break;
+
+      case "TOOL_CALL_END":
+        console.log("✅ Tool call finished:", agentEvent.toolName);
+        break;
+
+      case "TOOL_CALL_RESULT":
+        console.log("📊 Tool result:", agentEvent.result);
         break;
 
       case "RUN_FINISHED":
-        console.log("✅ Governance analysis complete");
+        console.log("✅ Run completed");
         setIsStreaming(false);
         setIsLoading(false);
 
-        const currentMessageId = streamMessageIdRef.current;
-        streamMessageIdRef.current = null;
+        if (agentEvent.result) {
+          console.log("📊 RUN_FINISHED with result:", agentEvent.result);
 
-        if (agentEvent.result && currentMessageId) {
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === currentMessageId
-                ? {
-                    ...msg,
-                    content: agentEvent.result.message || "ANALYSIS COMPLETE",
-                    data: {
-                      message: agentEvent.result.message,
-                      proposals: agentEvent.result.proposals || [],
-                      discussions: agentEvent.result.discussions || [],
-                      confidence: agentEvent.result.confidence || 0.8,
-                    },
-                  }
-                : msg
-            )
-          );
+          setMessages((prev) => {
+            let lastAssistantIndex = -1;
+            for (let i = prev.length - 1; i >= 0; i--) {
+              if (prev[i].type === "assistant") {
+                lastAssistantIndex = i;
+                break;
+              }
+            }
+
+            if (lastAssistantIndex >= 0) {
+              const updated = [...prev];
+              updated[lastAssistantIndex] = {
+                ...updated[lastAssistantIndex],
+                data: {
+                  message: agentEvent.result.message,
+                  proposals: agentEvent.result.proposals || [],
+                  discussions: agentEvent.result.discussions || [],
+                  confidence: agentEvent.result.confidence || 0.8,
+                  analysis: agentEvent.result.analysis || undefined,
+                },
+              };
+              return updated;
+            }
+            return prev;
+          });
         }
+
+        setTimeout(() => {
+          streamMessageIdRef.current = null;
+        }, 200);
         break;
 
       case "RUN_ERROR":
-        console.error("❌ Governance analysis error:", agentEvent.message);
+        console.error("❌ Run error:", agentEvent.message);
         setIsStreaming(false);
         setIsLoading(false);
         setMessages((prev) => [
@@ -224,19 +316,172 @@ export default function Chat({ mcpConnection }: ChatProps) {
         ]);
         break;
 
-      case "TEXT_MESSAGE_DELTA":
-        if (streamMessageIdRef.current) {
+      case "STEP_STARTED":
+        console.log("🚀 Step started:", agentEvent.step);
+        break;
+
+      case "STEP_FINISHED":
+        console.log("🏁 Step finished:", agentEvent.step);
+        break;
+
+      case "STATE_SNAPSHOT":
+        console.log("📸 State snapshot:", agentEvent.state);
+        break;
+
+      case "STATE_DELTA":
+        console.log("🔄 State delta:", agentEvent.delta);
+        break;
+
+      case "MESSAGES_SNAPSHOT":
+        console.log("💬 Messages snapshot:", agentEvent.messages);
+        break;
+
+      case "RAW":
+        console.log("📝 Raw event:", agentEvent.data);
+        break;
+
+      case "CUSTOM":
+        console.log(
+          "🎯 Custom AG-UI Event:",
+          agentEvent.name,
+          agentEvent.value
+        );
+
+        // Handle proposal sentiment
+        if (agentEvent.name === "SENTIMENT_ANALYSIS_COMPLETE") {
+          console.log("📊 Proposal sentiment complete:", agentEvent.value);
+
           setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === streamMessageIdRef.current
-                ? { ...msg, content: msg.content + agentEvent.delta }
-                : msg
-            )
+            prev.map((msg) => {
+              if (msg.data?.proposals) {
+                const updatedProposals = msg.data.proposals.map(
+                  (proposal: any) => {
+                    if (proposal.id === agentEvent.value.proposalId) {
+                      return {
+                        ...proposal,
+                        sentiment: {
+                          overall: agentEvent.value.overall,
+                          score: agentEvent.value.score,
+                          postsCount: agentEvent.value.postsCount,
+                          trends: agentEvent.value.trends,
+                          topConcerns: agentEvent.value.topConcerns || [],
+                          keySupport: agentEvent.value.keySupport || [],
+                          isLoading: false,
+                        },
+                      };
+                    }
+                    return proposal;
+                  }
+                );
+
+                return {
+                  ...msg,
+                  data: {
+                    ...msg.data,
+                    proposals: updatedProposals,
+                  },
+                };
+              }
+              return msg;
+            })
           );
         }
+
+        // Handle ecosystem sentiment
+        if (agentEvent.name === "ECOSYSTEM_SENTIMENT_COMPLETE") {
+          console.log("📊 Ecosystem sentiment complete:", agentEvent.value);
+        }
+        break;
+
+      default:
+        console.log("❓ Unknown event type:", agentEvent.type, agentEvent);
         break;
     }
   };
+
+  async function handleSentimentAnalysis() {
+    setIsLoading(true);
+    setIsStreaming(true);
+
+    try {
+      const res = await fetch(
+        `${getBaseUrl()}/agents/my-agent/${
+          mcpConnection.sessionId
+        }/query-with-events`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify({
+            claudeApiKey: localStorage.getItem("anthropic_key"),
+          }),
+        }
+      );
+
+      if (!res.body) {
+        console.error("No response body");
+        setIsLoading(false);
+        setIsStreaming(false);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        while (buffer.includes("\n\n")) {
+          const [chunk, ...rest] = buffer.split("\n\n");
+          buffer = rest.join("\n\n");
+
+          const lines = chunk.split("\n");
+          const eventType = lines
+            .find((line) => line.startsWith("event:"))
+            ?.split(":")[1]
+            ?.trim();
+          const dataLines = lines
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim());
+          const dataString = dataLines.join("\n");
+
+          try {
+            const parsed = JSON.parse(dataString);
+            console.log("📩 Event:", eventType, parsed);
+            handleAGUIEvent(parsed);
+          } catch (err) {
+            console.error("❌ Failed to parse SSE JSON:", err, dataString);
+          }
+        }
+      }
+
+      setIsLoading(false);
+      setIsStreaming(false);
+    } catch (error) {
+      console.error("❌ Sentiment analysis error:", error);
+      setIsLoading(false);
+      setIsStreaming(false);
+    }
+  }
+
+  // Helper to append an assistant message to the chat
+  function appendAssistantMessage(content: string) {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: nanoid(),
+        type: "assistant",
+        content,
+        timestamp: new Date(),
+      },
+    ]);
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -272,11 +517,12 @@ export default function Chat({ mcpConnection }: ChatProps) {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "x-api-key": getApiKey()!, // Use stored API key
+            Accept: "text/event-stream",
+            "x-api-key": getApiKey()!,
           },
           body: JSON.stringify({
             query,
-            claudeApiKey: getApiKey()!, // Use stored API key
+            claudeApiKey: getApiKey()!,
           }),
         }
       );
@@ -293,10 +539,39 @@ export default function Chat({ mcpConnection }: ChatProps) {
         }
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-      const data = (await response.json()) as { sessionId: string };
-      const querySessionId = data.sessionId;
-      startEventStream(querySessionId);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        while (buffer.includes("\n\n")) {
+          const [chunk, ...rest] = buffer.split("\n\n");
+          buffer = rest.join("\n\n");
+
+          const lines = chunk.split("\n");
+          const eventType = lines
+            .find((line) => line.startsWith("event:"))
+            ?.split(":")[1]
+            ?.trim();
+          const dataLines = lines
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim());
+          const dataString = dataLines.join("\n");
+
+          try {
+            const parsed = JSON.parse(dataString);
+            console.log("📩 Event:", eventType, parsed);
+            handleAGUIEvent(parsed);
+          } catch (err) {
+            console.error("❌ Failed to parse SSE JSON:", err, dataString);
+          }
+        }
+      }
     } catch (error) {
       console.error("Query error:", error);
       setIsLoading(false);
@@ -313,42 +588,16 @@ export default function Chat({ mcpConnection }: ChatProps) {
     }
   };
 
+  // Use ProposalCard component
   const renderProposalCard = (proposal: Proposal, index: number) => (
-    <div
+    <ProposalCard
       key={`proposal-${proposal.id}-${index}`}
-      className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-3"
-    >
-      <div className="flex items-start gap-3">
-        <FileText className="w-5 h-5 text-blue-600 mt-1 flex-shrink-0" />
-        <div className="flex-1">
-          <h4 className="font-semibold text-blue-900 mb-1">
-            Proposal #{proposal.id}
-          </h4>
-          <h5 className="font-medium text-gray-800 mb-2">{proposal.title}</h5>
-          <p className="text-gray-600 text-sm mb-2">{proposal.description}</p>
-          <div className="flex items-center gap-4 text-xs text-gray-500">
-            <span
-              className={`px-2 py-1 rounded-full ${
-                proposal.status === "Finished"
-                  ? "bg-gray-100 text-gray-700"
-                  : "bg-green-100 text-green-700"
-              }`}
-            >
-              {proposal.status}
-            </span>
-            <span>By: {proposal.proposer_id}</span>
-          </div>
-          {proposal.voting_options && (
-            <div className="mt-2">
-              <span className="text-xs text-gray-500">Options: </span>
-              <span className="text-xs text-gray-700">
-                {proposal.voting_options.join(", ")}
-              </span>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
+      proposal={proposal}
+      mcpConnection={mcpConnection}
+      onAGUIEvent={handleAGUIEvent}
+      index={index}
+      sentimentData={(proposal as any).sentiment}
+    />
   );
 
   const renderDiscussionCard = (discussion: Discussion, index: number) => (
@@ -392,15 +641,21 @@ export default function Chat({ mcpConnection }: ChatProps) {
             : "bg-gray-100 text-gray-800"
         }`}
       >
-        <p className="text-sm">{message.content}</p>
-
+        <div
+          className="text-sm prose prose-sm max-w-none"
+          dangerouslySetInnerHTML={{
+            __html: message.content
+              .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
+              .replace(/\n/g, "<br/>"),
+          }}
+        />
         {message.type === "assistant" && message.data && (
           <div className="mt-4 space-y-3">
             {message.data.proposals && message.data.proposals.length > 0 && (
               <div>
                 <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2">
                   <FileText className="w-4 h-4" />
-                  Proposals ({message.data.proposals.length})
+                  Smart Proposals ({message.data.proposals.length})
                 </h3>
                 {message.data.proposals.map((proposal, index) =>
                   renderProposalCard(proposal, index)
@@ -553,20 +808,48 @@ export default function Chat({ mcpConnection }: ChatProps) {
       <div className="h-16 bg-gradient-to-t from-white via-white/95 to-transparent" />
 
       <div className="bg-white/95 backdrop-blur-xl px-4 pt-5 pb-8">
-        {/* Suggestions */}
+        {/* Suggestions with sentiment analysis */}
         <div className="mb-4 flex flex-wrap gap-3 justify-center">
           {[
-            { text: "active proposals", display: "active proposals" },
-            { text: "new proposals", display: "new proposals" },
-            { text: "top forum topics", display: "top discussions" },
+            {
+              text: "active proposals",
+              display: "active proposals",
+              icon: "📋",
+              action: "query",
+            },
+            {
+              text: "new proposals",
+              display: "new proposals",
+              icon: "🆕",
+              action: "query",
+            },
+            {
+              text: "top forum topics",
+              display: "top discussions",
+              icon: "💬",
+              action: "query",
+            },
+            {
+              text: "sentiment_analysis",
+              display: "sentiment analysis",
+              icon: "📊",
+              action: "sentiment", // Special action type
+            },
           ].map((suggestion) => (
             <button
               key={suggestion.text}
-              onClick={() => setInputValue(suggestion.text)}
+              onClick={() => {
+                if (suggestion.action === "sentiment") {
+                  handleSentimentAnalysis();
+                } else {
+                  setInputValue(suggestion.text);
+                }
+              }}
               className="group px-5 py-3 bg-white/70 backdrop-blur-md text-gray-700 rounded-2xl hover:bg-white hover:text-gray-900 transition-all duration-300 border border-gray-200/50 hover:border-gray-300 hover:shadow-lg transform hover:scale-105 text-sm font-medium min-h-[44px]"
               disabled={isLoading}
               aria-label={`Quick search: ${suggestion.text}`}
             >
+              <span className="mr-2">{suggestion.icon}</span>
               {suggestion.display}
             </button>
           ))}
@@ -592,8 +875,7 @@ export default function Chat({ mcpConnection }: ChatProps) {
                     <div className="absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-400 pointer-events-none">
                       <span className="inline-block animate-pulse">💬</span>
                       <span className="ml-2">
-                        Ask about proposals, forum topics, community delegates,
-                        etc.
+                        Ask about proposals and forum discussions...
                       </span>
                     </div>
                   )}

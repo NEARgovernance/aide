@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { MCPServersState } from "agents";
 import { agentFetch } from "agents/client";
 import { nanoid } from "nanoid";
@@ -27,13 +27,34 @@ export interface MCPConnection {
   ) => Promise<void>;
   removeMcpServer: (serverId: string) => Promise<void>;
   refreshMcpState: () => Promise<void>;
+  analyzeSentiment: (proposalId: number, proposalTitle: string) => Promise<any>;
 }
 
+export interface ForumSentiment {
+  overall: "positive" | "negative" | "neutral" | "mixed";
+  score: number;
+  postsCount: number;
+  trends: {
+    support: number;
+    concerns: number;
+    questions: number;
+  };
+  topConcerns: string[];
+  keySupport: string[];
+  isLoading: boolean;
+}
+
+// Global connection state to prevent multiple connections
 let globalSessionId: string | null = null;
 let globalAutoConnectCompleted = false;
+let globalConnectionPromise: Promise<void> | null = null;
+let activeHookCount = 0;
 
 export function useMCPConnection(): MCPConnection {
-  if (!globalSessionId) globalSessionId = nanoid(8);
+  // Ensure single session ID
+  if (!globalSessionId) {
+    globalSessionId = nanoid(8);
+  }
 
   const host =
     window.location.hostname === "localhost"
@@ -48,7 +69,13 @@ export function useMCPConnection(): MCPConnection {
     tools: [],
   });
 
+  // Track if this hook instance is active
+  const isActiveRef = useRef(true);
+  const hasInitializedRef = useRef(false);
+
   const refreshMcpState = async () => {
+    if (!isActiveRef.current) return; // Prevent updates after unmount
+
     try {
       const response = await agentFetch(
         {
@@ -59,6 +86,9 @@ export function useMCPConnection(): MCPConnection {
         },
         { method: "GET" }
       );
+
+      if (!isActiveRef.current) return; // Check again after async operation
+
       if (response.ok) {
         const state = (await response.json()) as MCPServersState;
         setMcpState(state);
@@ -68,6 +98,7 @@ export function useMCPConnection(): MCPConnection {
         console.error("Failed to refresh MCP state:", response.status);
       }
     } catch (err) {
+      if (!isActiveRef.current) return;
       setIsConnected(false);
       console.error("Error refreshing MCP state:", err);
     }
@@ -100,7 +131,11 @@ export function useMCPConnection(): MCPConnection {
       throw new Error(`Server responded with ${response.status}: ${errorText}`);
     }
 
-    setTimeout(refreshMcpState, 1000);
+    setTimeout(() => {
+      if (isActiveRef.current) {
+        refreshMcpState();
+      }
+    }, 1000);
   };
 
   const removeMcpServer = async (serverId: string) => {
@@ -123,7 +158,11 @@ export function useMCPConnection(): MCPConnection {
       throw new Error(`Server responded with ${response.status}: ${errorText}`);
     }
 
-    setTimeout(refreshMcpState, 1000);
+    setTimeout(() => {
+      if (isActiveRef.current) {
+        refreshMcpState();
+      }
+    }, 1000);
   };
 
   const callTool = async (
@@ -153,53 +192,155 @@ export function useMCPConnection(): MCPConnection {
     return await response.json();
   };
 
-  const autoConnectDefaultServers = async () => {
-    if (globalAutoConnectCompleted) return;
-    globalAutoConnectCompleted = true;
+  const analyzeSentiment = async (
+    proposalId: number,
+    proposalTitle: string
+  ): Promise<ForumSentiment> => {
+    try {
+      const response = await agentFetch(
+        {
+          agent: "my-agent",
+          host,
+          name: globalSessionId!,
+          path: "sentiment-analysis",
+        },
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ proposalId, proposalTitle }),
+        }
+      );
 
-    const defaultServers = [
-      {
-        name: "NEAR Discourse",
-        url: "https://disco.multidaomensional.workers.dev/sse",
-        type: "direct" as const,
-      },
-      {
-        name: "House of Stake",
-        url: "https://mcp.bitte.ai/mcp?agentId=hos-agent.vercel.app",
-        type: "bitte" as const,
-      },
-    ];
-
-    for (const server of defaultServers) {
-      try {
-        await addMCPServer(server.name, server.url, server.type);
-        await new Promise((r) => setTimeout(r, 500));
-      } catch (err: any) {
-        console.warn(
-          `❌ Failed to auto-connect to ${server.name}:`,
-          err.message
-        );
+      if (!response.ok) {
+        throw new Error(`Sentiment analysis failed: ${response.status}`);
       }
+
+      return await response.json();
+    } catch (error) {
+      console.error("Sentiment analysis error:", error);
+      return {
+        overall: "neutral",
+        score: 50,
+        postsCount: 0,
+        trends: { support: 33, concerns: 33, questions: 34 },
+        topConcerns: ["Analysis unavailable"],
+        keySupport: ["Try again later"],
+        isLoading: false,
+      };
+    }
+  };
+
+  const autoConnectDefaultServers = async () => {
+    // Use a shared promise to prevent multiple simultaneous connection attempts
+    if (globalConnectionPromise) {
+      await globalConnectionPromise;
+      return;
     }
 
-    setTimeout(refreshMcpState, 1500);
+    if (globalAutoConnectCompleted) return;
+
+    console.log(`🔌 Starting auto-connect (Active hooks: ${activeHookCount})`);
+
+    globalConnectionPromise = (async () => {
+      globalAutoConnectCompleted = true;
+
+      const defaultServers = [
+        {
+          name: "NEAR Discourse",
+          url: "https://disco.multidaomensional.workers.dev/sse",
+          type: "direct" as const,
+        },
+        {
+          name: "House of Stake",
+          url: "https://mcp.bitte.ai/mcp?agentId=hos-agent.vercel.app",
+          type: "bitte" as const,
+        },
+      ];
+
+      for (const server of defaultServers) {
+        if (!isActiveRef.current) break; // Stop if component unmounted
+
+        try {
+          console.log(`🔌 Auto-connecting to ${server.name}...`);
+          await addMCPServer(server.name, server.url, server.type);
+          await new Promise((r) => setTimeout(r, 500));
+          console.log(`✅ Successfully connected to ${server.name}`);
+        } catch (err: any) {
+          console.warn(
+            `❌ Failed to auto-connect to ${server.name}:`,
+            err.message
+          );
+        }
+      }
+
+      setTimeout(() => {
+        if (isActiveRef.current) {
+          refreshMcpState();
+        }
+      }, 1500);
+    })();
+
+    await globalConnectionPromise;
+    globalConnectionPromise = null;
   };
 
   useEffect(() => {
-    refreshMcpState();
-    autoConnectDefaultServers();
+    // Prevent multiple initializations from the same hook instance
+    if (hasInitializedRef.current) return;
+    hasInitializedRef.current = true;
 
-    const interval = setInterval(refreshMcpState, 10000);
-    return () => clearInterval(interval);
-  }, []);
+    activeHookCount++;
+    console.log(
+      `🔗 Hook mounted (Active: ${activeHookCount}, Session: ${globalSessionId})`
+    );
+
+    // Initialize connection with proper sequencing
+    const initializeConnection = async () => {
+      try {
+        console.log("🚀 Starting initialization...");
+        await refreshMcpState();
+        console.log("📊 MCP state refreshed");
+        await autoConnectDefaultServers();
+        console.log("🎯 Initial connection setup complete");
+      } catch (error) {
+        console.error("❌ Initial connection setup failed:", error);
+      }
+    };
+
+    initializeConnection();
+
+    // Set up polling interval
+    const interval = setInterval(() => {
+      if (isActiveRef.current) {
+        refreshMcpState();
+      }
+    }, 10000);
+
+    // Cleanup function
+    return () => {
+      console.log(`🔌 Hook unmounting (Active: ${activeHookCount - 1})`);
+      activeHookCount--;
+      isActiveRef.current = false;
+      clearInterval(interval);
+
+      // Reset global state when no hooks are active
+      if (activeHookCount === 0) {
+        console.log("🧹 Resetting global connection state");
+        globalSessionId = null;
+        globalAutoConnectCompleted = false;
+        globalConnectionPromise = null;
+      }
+    };
+  }, []); // Empty dependency array is correct here
 
   return {
     isConnected,
     mcpState,
     sessionId: globalSessionId!,
     callTool,
-    addMCPServer,
+    addMCPServer: addMCPServer,
     removeMcpServer,
     refreshMcpState,
+    analyzeSentiment,
   };
 }

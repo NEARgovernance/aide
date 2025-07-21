@@ -7,7 +7,6 @@ import { nanoid } from "nanoid";
 type Env = {
   MyAgent: AgentNamespace<MyAgent>;
   HOST: string;
-  VITE_ANTHROPIC_API_KEY: string;
 };
 
 type State = {};
@@ -18,10 +17,18 @@ interface MCPServerConfig {
   type: "bitte" | "direct"; // Track server type
 }
 
+const SERVER_IDS = {
+  discourse: "near-discourse",
+  hos: "house-of-stake",
+};
+
 export class MyAgent extends Agent<Env, State> {
   private clients = new Map<string, Client>();
   private serverConfigs = new Map<string, MCPServerConfig>();
-  private eventControllers = new Map<string, ReadableStreamDefaultController>();
+  private eventControllers = new Map<
+    string,
+    WritableStreamDefaultWriter<Uint8Array>
+  >();
 
   private async getMcpState(): Promise<any> {
     const tools = [];
@@ -53,6 +60,201 @@ export class MyAgent extends Agent<Env, State> {
     }
 
     return { tools, servers };
+  }
+
+  private generateProposalSentimentPrompt(
+    forumData: any,
+    latestTopics: any,
+    proposalTitle: string,
+    proposalId: number
+  ): string {
+    return `Analyze forum sentiment for NEAR Proposal #${proposalId}: "${proposalTitle}"
+
+Forum Search Results: ${JSON.stringify(forumData, null, 2)}
+
+Latest Forum Topics: ${JSON.stringify(latestTopics, null, 2)}
+
+Instructions:
+- Look for posts that mention the proposal title, proposal ID, or related keywords
+- Analyze sentiment patterns in the discussions
+- Extract key support points and concerns
+- Estimate overall community sentiment
+
+Return JSON analysis:
+{
+  "overall": "positive|negative|neutral|mixed",
+  "score": 0-100,
+  "postsCount": number_of_relevant_posts,
+  "trends": {
+    "support": percentage_expressing_support,
+    "concerns": percentage_expressing_concerns,
+    "questions": percentage_asking_questions
+  },
+  "topConcerns": ["concern 1", "concern 2"],
+  "keySupport": ["support point 1", "support point 2"]
+}
+
+Be realistic - if there's limited forum activity, reflect that in the analysis.`;
+  }
+
+  private generateEcosystemSentimentPrompt(
+    forumData: any,
+    additionalData: any
+  ): string {
+    return `Analyze the NEAR governance ecosystem sentiment and health:
+
+Forum Data: ${JSON.stringify(forumData, null, 2)}
+Additional Data: ${JSON.stringify(additionalData, null, 2)}
+
+Please provide a comprehensive analysis of:
+- Overall ecosystem sentiment and health
+- Community engagement levels
+- Governance participation trends
+- Key developments and concerns
+- Future outlook
+
+Be specific about what the data shows.`;
+  }
+
+  private getProposalSentimentFallback() {
+    return {
+      overall: "neutral",
+      score: 50,
+      postsCount: 0,
+      trends: { support: 33, concerns: 33, questions: 34 },
+      topConcerns: ["Analysis unavailable"],
+      keySupport: ["Try again later"],
+    };
+  }
+
+  // FALLBACK: Ecosystem sentiment fallback
+  private getEcosystemSentimentFallback() {
+    return {
+      overall: "neutral",
+      score: 50,
+      engagement_level: "medium",
+      governance_health: "fair",
+      key_trends: ["Analysis unavailable"],
+      hot_topics: [],
+      community_concerns: ["Service temporarily down"],
+      positive_signals: [],
+      summary: "Ecosystem sentiment analysis temporarily unavailable.",
+    };
+  }
+
+  // Claude Sentiment Analysis
+  async claudeAnalyzeSentiment(
+    forumData: string,
+    additionalData: string,
+    title: string,
+    proposalId: number,
+    scope: "proposal" | "ecosystem",
+    apiKey: string
+  ) {
+    if (!apiKey || !apiKey.startsWith("sk-ant-")) {
+      throw new Error("Claude API key not configured or invalid");
+    }
+
+    // Find the correct client for proposal data (e.g., House of Stake server)
+    const hosServer = Array.from(this.clients.keys()).find(
+      (name) =>
+        name.toLowerCase().includes("stake") ||
+        name.toLowerCase().includes("hos") ||
+        name.toLowerCase().includes("bitte")
+    );
+    let proposalData = null;
+    if (hosServer && this.clients.has(hosServer)) {
+      proposalData = await this.clients.get(hosServer)!.callTool({
+        name: "getrecentproposals",
+        arguments: {},
+      });
+    }
+
+    const prompt =
+      scope === "proposal"
+        ? this.generateProposalSentimentPrompt(
+            forumData,
+            additionalData,
+            title,
+            proposalId
+          )
+        : this.generateEcosystemSentimentPrompt(forumData, additionalData);
+
+    const body = {
+      model: "claude-sonnet-4-20250514", // Updated model
+      system:
+        "You are a wise and credibly neutral governance analyst. It is currently the year 2025. Any forum posts should be treated as valid historical data.",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: `Summarize the ecosystem governance sentiment from this:\n\nForum Data:\n${JSON.stringify(
+            forumData,
+            null,
+            2
+          )}\n\nProposal Data:\n${JSON.stringify(
+            proposalData,
+            null,
+            2
+          )}\n\nAdditional Data:\n${JSON.stringify(additionalData, null, 2)}`,
+        },
+      ],
+    };
+
+    try {
+      let response: Response | undefined = undefined;
+      let retries = 3;
+
+      for (let i = 0; i < retries; i++) {
+        response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (response.ok) {
+          break; // Success, exit retry loop
+        }
+
+        if (response.status === 529 && i < retries - 1) {
+          const delay = Math.pow(2, i) * 1000; // 1s, 2s, 4s delays
+          console.log(`⏳ Claude overloaded, retrying in ${delay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+
+        // If not overloaded or final retry, throw error
+        const errorText = await response.text();
+        throw new Error(`Claude API error (${response.status}): ${errorText}`);
+      }
+
+      if (!response) {
+        throw new Error("No response received after retries");
+      }
+
+      const result = (await response.json()) as {
+        content?: Array<{ text: string }>;
+      };
+
+      const text = result?.content?.[0]?.text ?? "";
+      console.log("🔍 Claude sentiment analysis:", text);
+
+      return {
+        analysis: text,
+        raw_text: text,
+      };
+    } catch (error) {
+      console.error(`❌ Claude ${scope} sentiment analysis failed:`, error);
+      return {
+        analysis:
+          "Unable to analyze sentiment at this time. Please try again later.",
+        raw_text: "",
+      };
+    }
   }
 
   private generateGovernanceToolCalls(
@@ -318,7 +520,7 @@ export class MyAgent extends Agent<Env, State> {
       }));
 
       const claudeRequest = {
-        model: "claude-3-5-sonnet-20241022",
+        model: "claude-sonnet-4-20250514",
         max_tokens: 1500,
         messages: [
           {
@@ -356,7 +558,9 @@ Examples:
 - "active proposals" → return only proposals with "Voting" status
 - "latest proposals" → return multiple recent proposals
 
-Return JSON format:
+CRITICAL: You MUST respond with ONLY valid JSON. No additional text before or after.
+
+Return EXACTLY this JSON format:
 {
   "relevant_proposal_ids": [array of relevant proposal IDs],
   "relevant_discussion_ids": [array of relevant discussion IDs],
@@ -366,9 +570,11 @@ Return JSON format:
         ],
       };
 
-      const claudeResponse = await fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
+      let claudeResponse: Response | undefined = undefined;
+      let retries = 3;
+
+      for (let i = 0; i < retries; i++) {
+        claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -376,13 +582,32 @@ Return JSON format:
             "anthropic-version": "2023-06-01",
           },
           body: JSON.stringify(claudeRequest),
-        }
-      );
+        });
 
-      if (!claudeResponse.ok) {
-        console.error("Claude API error:", claudeResponse.status);
+        if (claudeResponse.ok) {
+          break; // Success, exit retry loop
+        }
+
+        if (claudeResponse.status === 529 && i < retries - 1) {
+          const delay = Math.pow(2, i) * 1000; // 1s, 2s, 4s delays
+          console.log(
+            `⏳ Claude filtering overloaded, retrying in ${delay}ms...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+
+        const errorText = await claudeResponse.text();
+        console.error(
+          `❌ Claude filtering API error (${claudeResponse.status}):`,
+          errorText
+        );
         // Fallback to returning all data if Claude fails
         return rawData;
+      }
+
+      if (!claudeResponse) {
+        throw new Error("No response received after retries");
       }
 
       const claudeResult = (await claudeResponse.json()) as {
@@ -450,7 +675,7 @@ Return JSON format:
       console.log(`🧠 Asking Claude to analyze results for query: "${query}"`);
 
       const claudeRequest = {
-        model: "claude-3-5-sonnet-20241022",
+        model: "claude-sonnet-4-20250514",
         max_tokens: 1000,
         messages: [
           {
@@ -471,7 +696,9 @@ Examples:
 
 If it's a general query like "show me budget proposals", just return a summary.
 
-Return JSON format:
+CRITICAL: You MUST respond with ONLY valid JSON. No additional text before or after.
+
+Return EXACTLY this JSON format:
 {
   "answer": "Direct answer to the user's question",
   "analysis": "Brief analysis of the data"
@@ -480,9 +707,11 @@ Return JSON format:
         ],
       };
 
-      const claudeResponse = await fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
+      let claudeResponse: Response | undefined = undefined;
+      let retries = 3;
+
+      for (let i = 0; i < retries; i++) {
+        claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -490,12 +719,31 @@ Return JSON format:
             "anthropic-version": "2023-06-01",
           },
           body: JSON.stringify(claudeRequest),
-        }
-      );
+        });
 
-      if (!claudeResponse.ok) {
-        console.error("Claude analysis API error:", claudeResponse.status);
+        if (claudeResponse.ok) {
+          break; // Success, exit retry loop
+        }
+
+        if (claudeResponse.status === 529 && i < retries - 1) {
+          const delay = Math.pow(2, i) * 1000; // 1s, 2s, 4s delays
+          console.log(
+            `⏳ Claude analysis overloaded, retrying in ${delay}ms...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+
+        const errorText = await claudeResponse.text();
+        console.error(
+          `❌ Claude analysis API error (${claudeResponse.status}):`,
+          errorText
+        );
         return { answer: null, analysis: null };
+      }
+
+      if (!claudeResponse) {
+        throw new Error("No response received after retries");
       }
 
       const claudeResult = (await claudeResponse.json()) as {
@@ -578,7 +826,7 @@ Return JSON format:
         });
       }
 
-      // Start assistant message
+      // Start assistant message using proper AG-UI events
       const messageId = nanoid();
       this.emitToSession(sessionId, {
         type: "TEXT_MESSAGE_START",
@@ -595,7 +843,6 @@ Return JSON format:
         timestamp: Date.now(),
       });
 
-      // Use your existing logic with events
       const mcpState = await this.getMcpState();
       this.emitToSession(sessionId, {
         type: "TEXT_MESSAGE_CONTENT",
@@ -625,7 +872,6 @@ Return JSON format:
         timestamp: Date.now(),
       });
 
-      // Your existing Claude filtering
       this.emitToSession(sessionId, {
         type: "TEXT_MESSAGE_CONTENT",
         messageId,
@@ -654,13 +900,14 @@ Return JSON format:
         });
       }
 
-      // End message and run
+      // End message properly
       this.emitToSession(sessionId, {
         type: "TEXT_MESSAGE_END",
         messageId,
         timestamp: Date.now(),
       });
 
+      // Finish run with results
       this.emitToSession(sessionId, {
         type: "RUN_FINISHED",
         threadId,
@@ -678,6 +925,7 @@ Return JSON format:
         `❌ Query processing error for session ${sessionId}:`,
         error
       );
+
       this.emitToSession(sessionId, {
         type: "RUN_ERROR",
         message: (error as Error).message,
@@ -691,26 +939,29 @@ Return JSON format:
     }
   }
 
-  private emitToSession(sessionId: string | null, event: any) {
+  private async emitToSession(sessionId: string | null, event: any) {
     if (!sessionId) return;
 
-    const controller = this.eventControllers.get(sessionId);
-    if (controller) {
-      const eventData = `data: ${JSON.stringify(event)}\n\n`;
+    const writer = this.eventControllers.get(sessionId);
+    if (!writer) {
+      console.warn(`⚠️ No writer for session ${sessionId}`);
+      return;
+    }
+
+    const encoder = new TextEncoder();
+    const formatted = `event: ${event.type}\ndata: ${JSON.stringify(
+      event
+    )}\n\n`;
+
+    try {
+      await writer.write(encoder.encode(formatted));
+      console.log(`📤 Emitted ${event.type} to session ${sessionId}`);
+    } catch (err) {
+      console.error(`❌ Failed to emit to session ${sessionId}:`, err);
+      this.eventControllers.delete(sessionId);
       try {
-        controller.enqueue(new TextEncoder().encode(eventData));
-        console.log(`📤 Emitted ${event.type} to session ${sessionId}`);
-      } catch (err) {
-        console.warn(
-          `Failed to emit event to session ${sessionId}:`,
-          err instanceof Error ? err.message : String(err)
-        );
-        this.eventControllers.delete(sessionId);
-      }
-    } else {
-      console.warn(
-        `⚠️ No controller for session ${sessionId}, event: ${event.type}`
-      );
+        await writer.close();
+      } catch {}
     }
   }
 
@@ -758,78 +1009,73 @@ Return JSON format:
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
+    if (path === "sentiment-analysis" && request.method === "POST") {
+      const body = (await request.json()) as { claudeApiKey?: string };
+      const sessionId = nanoid();
+
+      const { proposalId, proposalTitle } = body as {
+        proposalId: number;
+        proposalTitle: string;
+      };
+
+      console.log(
+        `🎭 Starting proposal sentiment analysis for proposal ${proposalId}`
+      );
+
+      await this.performSentimentAnalysis("proposal", sessionId, {
+        proposalId,
+        proposalTitle,
+      });
+
+      return this.createCorsResponse(JSON.stringify({ sessionId }), 200);
+    }
+
     if (path === "events" && request.method === "GET") {
       console.log("🔧 Events endpoint hit");
 
-      const sessionId = url.searchParams.get("session");
-      let keepAliveInterval: any;
-      let cleanupTimeout: any;
+      const sessionId = url.searchParams.get("session") || crypto.randomUUID();
+      const encoder = new TextEncoder();
 
-      const stream = new ReadableStream({
-        start: (controller) => {
-          // Store controller for this session
-          if (sessionId) {
-            this.eventControllers.set(sessionId, controller);
-            console.log(`🔧 Event controller stored for session: ${sessionId}`);
-          }
+      const { readable, writable } = new TransformStream();
+      const { writable: eventWritable } = new TransformStream();
+      const writer = writable.getWriter();
 
-          // Send initial connection event
-          this.emitToSession(sessionId, {
-            type: "CONNECTION_ESTABLISHED",
+      this.eventControllers.set(sessionId, writer);
+      console.log(`🔧 Event writer stored for session: ${sessionId}`);
+
+      // Send initial connection event
+      await writer.write(
+        encoder.encode(
+          `event: CONNECTION_ESTABLISHED\ndata: ${JSON.stringify({
             sessionId,
             timestamp: Date.now(),
-          });
+          })}\n\n`
+        )
+      );
 
-          // Keep alive with better error handling
-          keepAliveInterval = setInterval(() => {
-            try {
-              // Check if controller is still valid
-              if (this.eventControllers.has(sessionId || "")) {
-                controller.enqueue(
-                  new TextEncoder().encode(`: keep-alive\n\n`)
-                );
-              } else {
-                // Controller was removed, stop keep-alive
-                clearInterval(keepAliveInterval);
-              }
-            } catch (err) {
-              console.warn(
-                `Keep-alive failed for session ${sessionId}:`,
-                err instanceof Error ? err.message : String(err)
-              );
-              clearInterval(keepAliveInterval);
-              // Clean up the controller reference
-              if (sessionId) {
-                this.eventControllers.delete(sessionId);
-              }
-            }
-          }, 30000);
+      // Keep-alive ping every 30s
+      const keepAlive = setInterval(async () => {
+        try {
+          await writer.write(encoder.encode(`: keep-alive\n\n`));
+        } catch (err) {
+          console.warn(`Keep-alive failed for session ${sessionId}:`, err);
+          clearInterval(keepAlive);
+          this.eventControllers.delete(sessionId);
+          await writer.close();
+        }
+      }, 30000);
 
-          // Cleanup after 5 minutes
-          cleanupTimeout = setTimeout(() => {
-            clearInterval(keepAliveInterval);
-            if (sessionId) {
-              this.eventControllers.delete(sessionId);
-            }
-            try {
-              controller.close();
-            } catch (err) {
-              // Stream already closed, ignore
-            }
-          }, 5 * 60 * 1000);
-        },
+      // Cleanup after 5 minutes
+      const shutdown = setTimeout(async () => {
+        clearInterval(keepAlive);
+        this.eventControllers.delete(sessionId);
+        try {
+          await writer.close();
+        } catch (_) {}
+      }, 5 * 60 * 1000);
 
-        cancel: () => {
-          console.log(`🔌 Client disconnected from session: ${sessionId}`);
-          clearInterval(keepAliveInterval);
-          clearTimeout(cleanupTimeout);
-          if (sessionId) {
-            this.eventControllers.delete(sessionId);
-          }
-        },
-      });
-
-      return new Response(stream, {
+      // Return readable stream as SSE response
+      return new Response(readable, {
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
@@ -885,39 +1131,103 @@ Return JSON format:
       }
     }
 
+    if (path === "query-with-events" && request.method === "GET") {
+      const sessionId = url.searchParams.get("session") || crypto.randomUUID();
+      const encoder = new TextEncoder();
+
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+
+      // Save writer for later emission
+      this.eventControllers.set(sessionId, writer);
+
+      // Send initial connected message
+      await writer.write(encoder.encode(`: connected\n\n`));
+
+      // Optionally send keep-alive pings
+      const keepAlive = setInterval(() => {
+        writer.write(encoder.encode(`: keep-alive\n\n`)).catch((err) => {
+          console.warn("Keep-alive failed:", err);
+          clearInterval(keepAlive);
+        });
+      }, 10000);
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
+    }
+
     if (path === "query-with-events" && request.method === "POST") {
-      console.log("🔧 Query with events endpoint hit");
-      try {
-        const body = (await request.json()) as {
-          query: string;
-          claudeApiKey?: string;
-        };
+      const body = await request.json();
 
-        const claudeApiKey =
-          body.claudeApiKey || request.headers.get("x-api-key");
-        if (!claudeApiKey) {
-          return this.createCorsResponse(
-            JSON.stringify({ error: "Claude API key required" }),
-            400
-          );
+      const pathSegments = url.pathname.split("/").filter(Boolean);
+      const sessionId = pathSegments.at(-2) ?? nanoid();
+      const agent = this;
+
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+
+      agent.eventControllers.set(sessionId, writer);
+
+      const encoder = new TextEncoder();
+
+      const send = (event: any) => {
+        const formatted = `data: ${JSON.stringify(event)}\n\n`;
+        writer.write(encoder.encode(formatted));
+      };
+
+      (async () => {
+        try {
+          send({ type: "RUN_STARTED", sessionId });
+
+          const parsedBody = body as { query?: string; claudeApiKey?: string };
+          const { query, claudeApiKey, ...otherArgs } = parsedBody;
+
+          if (query && query.trim()) {
+            console.log(`🧠 Processing query: "${query}"`);
+            await agent.processQueryWithEvents(
+              query,
+              claudeApiKey || "",
+              sessionId
+            );
+          } else {
+            console.log(
+              "🌐 No query provided, running ecosystem sentiment analysis"
+            );
+            await agent.performSentimentAnalysis("ecosystem", sessionId, {
+              ...otherArgs,
+              claudeApiKey,
+            });
+          }
+
+          send({ type: "RUN_FINISHED", sessionId });
+        } catch (err) {
+          const message =
+            typeof err === "object" && err && "message" in err
+              ? (err as any).message
+              : String(err);
+          console.error("❌ Query processing failed:", message);
+          send({ type: "RUN_ERROR", message, sessionId });
+        } finally {
+          await writer.close();
+          agent.eventControllers.delete(sessionId);
         }
+      })();
 
-        // Generate session ID for this query
-        const sessionId = nanoid();
-        console.log(`🔧 Starting query session: ${sessionId}`);
-
-        // Start processing in background
-        this.processQueryWithEvents(body.query, claudeApiKey, sessionId);
-
-        // Return session ID immediately
-        return this.createCorsResponse(JSON.stringify({ sessionId }), 200);
-      } catch (err: any) {
-        console.error("🔧 Query with events error:", err);
-        return this.createCorsResponse(
-          JSON.stringify({ error: err.message }),
-          500
-        );
-      }
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
     }
 
     if (path === "query" && request.method === "POST") {
@@ -1368,6 +1678,304 @@ Return JSON format:
     return args;
   }
 
+  private async callTool(
+    toolName: string,
+    serverId: string,
+    args: Record<string, any>
+  ): Promise<any> {
+    if (!this.clients.has(serverId)) {
+      throw new Error(`Server ${serverId} not found`);
+    }
+
+    const client = this.clients.get(serverId)!;
+    const result = await client.callTool({
+      name: toolName,
+      arguments: args,
+    });
+
+    return result;
+  }
+
+  private async performSentimentAnalysis(
+    scope: "proposal" | "ecosystem",
+    sessionId: string,
+    options: {
+      proposalId?: number;
+      proposalTitle?: string;
+      claudeApiKey?: string;
+    }
+  ) {
+    try {
+      // Wait for event stream connection
+      let attempts = 0;
+      while (!this.eventControllers.has(sessionId) && attempts < 10) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        attempts++;
+      }
+
+      if (!this.eventControllers.has(sessionId)) {
+        console.warn(`⚠️ No event controller found for session ${sessionId}`);
+        return;
+      }
+
+      // Emit start event
+      if (scope === "proposal") {
+        this.emitToSession(sessionId, {
+          type: "CUSTOM",
+          name: "SENTIMENT_ANALYSIS_STARTED",
+          value: {
+            proposalId: options.proposalId,
+            proposalTitle: options.proposalTitle,
+          },
+        });
+        console.log(
+          `🎭 Starting proposal sentiment analysis for proposal ${options.proposalId}`
+        );
+      } else {
+        this.emitToSession(sessionId, {
+          type: "CUSTOM",
+          name: "ECOSYSTEM_SENTIMENT_STARTED",
+          value: { scope: "ecosystem" },
+        });
+        console.log("🌐 Starting ecosystem sentiment analysis");
+      }
+
+      // Validate and log API key
+      const claudeApiKey = options.claudeApiKey;
+      if (!claudeApiKey) {
+        throw new Error("Claude API key not provided");
+      }
+      console.log("🔐 Using Claude key from frontend (hidden)");
+
+      // Gather data and analyze sentiment
+      const sentimentData = await this.gatherSentimentData(scope, options);
+      const sentimentResult = await this.claudeAnalyzeSentiment(
+        sentimentData.forumData,
+        sentimentData.additionalData,
+        options.proposalTitle ?? "ecosystem analysis",
+        options.proposalId ?? 0,
+        scope,
+        claudeApiKey
+      );
+
+      // Emit custom result
+      const eventName =
+        scope === "proposal"
+          ? "SENTIMENT_ANALYSIS_COMPLETE"
+          : "ECOSYSTEM_SENTIMENT_COMPLETE";
+
+      await this.emitToSession(sessionId, {
+        type: "CUSTOM",
+        name: eventName,
+        value: sentimentResult,
+      });
+
+      const header =
+        scope === "ecosystem"
+          ? "🧠 **Governance Ecosystem Analysis**\n\n"
+          : `🧠 **Proposal #${options.proposalId} Sentiment Analysis**\n\n`;
+
+      const analysisText =
+        sentimentResult?.analysis ||
+        sentimentResult?.raw_text ||
+        "Analysis complete.";
+
+      // AG-UI event sequence
+      const messageId = nanoid();
+
+      // Start the message
+      await this.emitToSession(sessionId, {
+        type: "TEXT_MESSAGE_START",
+        messageId,
+        role: "assistant",
+        timestamp: Date.now(),
+      });
+
+      await this.emitToSession(sessionId, {
+        type: "TEXT_MESSAGE_CONTENT",
+        messageId,
+        delta: header + analysisText,
+        timestamp: Date.now(),
+      });
+
+      // End the message
+      await this.emitToSession(sessionId, {
+        type: "TEXT_MESSAGE_END",
+        messageId,
+        timestamp: Date.now(),
+      });
+    } catch (error) {
+      console.error(`${scope} sentiment analysis failed:`, error);
+
+      const fallbackResult = {
+        analysis:
+          "Unable to analyze sentiment at this time. Please try again later.",
+        raw_text: "",
+      };
+
+      // Error message using proper AG-UI events
+      const errorMessageId = nanoid();
+
+      await this.emitToSession(sessionId, {
+        type: "TEXT_MESSAGE_START",
+        messageId: errorMessageId,
+        role: "assistant",
+        timestamp: Date.now(),
+      });
+
+      await this.emitToSession(sessionId, {
+        type: "TEXT_MESSAGE_CONTENT",
+        messageId: errorMessageId,
+        delta: `⚠️ Sentiment analysis failed: ${
+          error && typeof error === "object" && "message" in error
+            ? (error as any).message
+            : String(error)
+        }`,
+        timestamp: Date.now(),
+      });
+
+      await this.emitToSession(sessionId, {
+        type: "TEXT_MESSAGE_END",
+        messageId: errorMessageId,
+        timestamp: Date.now(),
+      });
+
+      await this.emitToSession(sessionId, {
+        type: "CUSTOM",
+        name:
+          scope === "proposal"
+            ? "SENTIMENT_ANALYSIS_COMPLETE"
+            : "ECOSYSTEM_SENTIMENT_COMPLETE",
+        value: fallbackResult,
+      });
+    }
+  }
+
+  private async gatherSentimentData(
+    scope: "proposal" | "ecosystem",
+    options: { proposalId?: number; proposalTitle?: string }
+  ): Promise<{ forumData: any; additionalData: any }> {
+    console.log(`🔍 Available servers for sentiment analysis:`, [
+      ...this.clients.keys(),
+    ]);
+
+    const discourseServer = [...this.clients.keys()].find((name) => {
+      const nameLower = name.toLowerCase();
+      console.log(`🔍 Checking server: "${name}" (lowercase: "${nameLower}")`);
+      const matches =
+        nameLower.includes("discourse") ||
+        nameLower.includes("near") ||
+        nameLower.includes("disco");
+      console.log(`🔍 Server "${name}" matches: ${matches}`);
+      return matches;
+    });
+
+    console.log(`🔍 Final discourse server result: ${discourseServer}`);
+
+    if (!discourseServer) {
+      console.warn("⚠️ Discourse server not found. Skipping forum data.");
+    }
+
+    if (scope === "proposal") {
+      if (!discourseServer) {
+        return {
+          forumData: [],
+          additionalData: [],
+        };
+      }
+
+      try {
+        console.log(
+          `🔍 Searching forum for proposal ${options.proposalId}: "${options.proposalTitle}"`
+        );
+
+        const forumResults = await this.callTool(
+          "search_posts",
+          discourseServer,
+          {
+            query: `${options.proposalTitle} proposal ${options.proposalId}`,
+            max_results: 20,
+          }
+        );
+
+        const latestTopics = await this.callTool(
+          "get_latest_topics",
+          discourseServer,
+          {
+            per_page: 10,
+          }
+        );
+
+        return {
+          forumData: forumResults,
+          additionalData: latestTopics,
+        };
+      } catch (err) {
+        console.warn("⚠️ Failed to fetch proposal-related forum data:", err);
+        return {
+          forumData: [],
+          additionalData: [],
+        };
+      }
+    } else {
+      console.log(`🌐 Gathering ecosystem-wide sentiment data`);
+
+      let latestTopics = [];
+      let recentPosts = null;
+
+      if (discourseServer) {
+        try {
+          latestTopics = await this.callTool(
+            "get_latest_topics",
+            discourseServer,
+            {
+              per_page: 20,
+            }
+          );
+        } catch (err) {
+          console.warn("⚠️ Failed to fetch latest topics:", err);
+        }
+
+        try {
+          recentPosts = await this.callTool(
+            "get_recent_posts",
+            discourseServer,
+            {
+              limit: 15,
+            }
+          );
+        } catch (err) {
+          console.warn("⚠️ Failed to fetch recent posts:", err);
+        }
+      }
+
+      const hosServer = Object.keys(this.clients).find(
+        (name) =>
+          name.toLowerCase().includes("stake") ||
+          name.toLowerCase().includes("bitte")
+      );
+
+      let proposalData = null;
+      if (hosServer) {
+        try {
+          proposalData = await this.callTool("getrecentproposals", hosServer, {
+            limit: 15,
+          });
+        } catch (err) {
+          console.warn(
+            "⚠️ Could not get proposal data for ecosystem sentiment:",
+            err
+          );
+        }
+      }
+
+      return {
+        forumData: latestTopics,
+        additionalData: { recentPosts, proposalData },
+      };
+    }
+  }
+
   private createCorsHeaders(acrh: string = "") {
     const requiredHeaders = [
       "content-type",
@@ -1417,11 +2025,21 @@ Return JSON format:
   }
 }
 
-function emitEvent(controller: ReadableStreamDefaultController, event: any) {
+async function emitEvent(
+  writer: WritableStreamDefaultWriter,
+  event: Record<string, any>
+) {
+  const encoder = new TextEncoder();
+  const formatted = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+
   try {
-    controller.enqueue(`data: ${JSON.stringify(event)}\n\n`);
+    await writer.write(encoder.encode(formatted));
+    console.log(`📤 Emitted event: ${event.type}`);
   } catch (err) {
-    console.warn("⚠️ Failed to enqueue event (stream may be closed):", err);
+    console.error("❌ Failed to write event:", err);
+    try {
+      await writer.close();
+    } catch (_) {}
   }
 }
 
@@ -1460,8 +2078,6 @@ export default {
     } catch (error) {
       console.error("❌ Agent routing error:", error);
     }
-
-    // Custom endpoints (non-agent routes)
 
     // SSE endpoint for general events
     if (request.method === "GET" && url.pathname === "/query-with-events") {
